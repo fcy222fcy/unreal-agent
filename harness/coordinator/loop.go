@@ -243,6 +243,14 @@ func (current *coordinator) processModelResponse(ctx context.Context, modelRespo
 	if err != nil {
 		return err
 	}
+	if failedResponse(modelResponse.response) && !current.compactionTurn(modelResponse.turnID) {
+		// A provider can answer HTTP 200 with a failed response instead of a Go
+		// error. The turn's input is spent, so the run cannot answer it: record
+		// the failure above for the session log, then fail the run instead of
+		// dispatching any tool calls the failed response may carry. Compaction
+		// turns are exempt; an unsummarizable context is retried, not a failed run.
+		return fmt.Errorf("model response for turn %q failed: %s", modelResponse.turnID, failureText(modelResponse.response.Failure))
+	}
 	for _, status := range statuses {
 		for _, value := range status.Operations {
 			if err := current.dispatchOperationToManager(value); err != nil {
@@ -257,6 +265,29 @@ func (current *coordinator) processModelResponse(ctx context.Context, modelRespo
 		current.state.grace = time.After(toolCallRunGracePeriod)
 	}
 	return nil
+}
+
+func (current *coordinator) compactionTurn(turnID session.TurnID) bool {
+	return current.state.currentTurnType == session.TurnCompaction && current.state.currentTurnID == turnID
+}
+
+// failedResponse reports whether the provider failed the response itself: a
+// failure without a stop reason means the response never completed (for example
+// a response.failed event carrying insufficient_quota). A failure with a stop
+// reason is an ordinary outcome; a refusal still answered the turn.
+func failedResponse(response llm.Response) bool {
+	return response.Failure != nil && response.Stop == ""
+}
+
+func failureText(failure *llm.Failure) string {
+	switch {
+	case failure.Code == "":
+		return failure.Message
+	case failure.Message == "":
+		return failure.Code
+	default:
+		return failure.Code + ": " + failure.Message
+	}
 }
 
 func (current *coordinator) clearToolGrace() {
@@ -638,16 +669,29 @@ func (current *coordinator) addItemToLocalState(
 				item.Data,
 			)
 		}
-		if current.state.currentTurnType == session.TurnCompaction && response.TurnID == current.state.currentTurnID {
+		if current.compactionTurn(response.TurnID) {
 			current.applyCompactionResponse(response.Response)
 			return item, nil
 		}
-		// The complete output includes messages, reasoning, and tool calls.
-		current.dependencies.ContextBuilder.AddModelResponse(response.Response)
+		// The complete output includes messages, reasoning, and tool calls. A
+		// failed response never produced tool results, so its tool calls stay in
+		// the session record but enter neither the context (an orphaned
+		// function_call item is rejected by providers on later requests) nor local
+		// state (the call must not run, including after a session resume replays
+		// this response).
+		contextResponse := response.Response
+		if failedResponse(response.Response) {
+			contextResponse.Output = slices.DeleteFunc(slices.Clone(response.Response.Output), func(item llm.Item) bool {
+				return item.Type == llm.ItemToolCall
+			})
+		}
+		current.dependencies.ContextBuilder.AddModelResponse(contextResponse)
 		if response.TurnID == current.state.currentTurnID {
 			current.state.deliveredInputs = current.state.currentTurnInputs
 		}
-		current.addToolCallsToLocalState(response)
+		if !failedResponse(response.Response) {
+			current.addToolCallsToLocalState(response)
+		}
 
 	case sessionstore.ItemToolCallStatus:
 		status, ok := item.Data.(sessionstore.ToolCallStatus)
